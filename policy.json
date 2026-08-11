@@ -1,0 +1,35 @@
+{
+  "version": "2.0",
+  "statement": [
+    {
+      "effect": "allow",
+      "action": [
+        "cos:GetObject",
+        "cos:HeadObject"
+      ],
+      "resource": [
+        "qcs::cos:${region}:uid/${appid}:${source-bucket}/*"
+      ]
+    },
+    {
+      "effect": "allow",
+      "action": [
+        "cos:PutObject",
+        "cos:PutObjectACL"
+      ],
+      "resource": [
+        "qcs::cos:${region}:uid/${appid}:${dest-bucket}/*"
+      ]
+    },
+    {
+      "effect": "allow",
+      "action": [
+        "cls:CreateLogset",
+        "cls:CreateTopic",
+        "cls:PutLogs",
+        "cls:SearchLog"
+      ],
+      "resource": "*"
+    }
+  ]
+}
