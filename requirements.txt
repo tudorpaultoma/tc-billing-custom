@@ -1,2 +1,1 @@
-# No external dependencies — stdlib only.
-# This file exists so pip-based tooling doesn't error on missing requirements.txt.
+tencentcloud-sdk-python>=3.0.1000

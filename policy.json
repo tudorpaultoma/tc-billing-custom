@@ -4,18 +4,14 @@
     {
       "effect": "allow",
       "action": [
-        "cos:GetObject",
-        "cos:HeadObject"
+        "billing:DescribeBillDetail"
       ],
-      "resource": [
-        "qcs::cos:${region}:uid/${appid}:${source-bucket}/*"
-      ]
+      "resource": "*"
     },
     {
       "effect": "allow",
       "action": [
-        "cos:PutObject",
-        "cos:PutObjectACL"
+        "cos:PutObject"
       ],
       "resource": [
         "qcs::cos:${region}:uid/${appid}:${dest-bucket}/*"

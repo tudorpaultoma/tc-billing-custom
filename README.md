@@ -1,58 +1,68 @@
 # tc-billing-custom
 
-Tencent Cloud billing aggregation SCF. Reads a monthly detailed bill CSV from a
-COS bucket, groups it by payer / owner / product / day-range, sums all cost
-columns, and writes the aggregated CSV to a destination COS bucket.
+Tencent Cloud billing aggregation SCF. Pulls monthly bill detail from the
+`DescribeBillDetail` API, flattens the component-level breakdown, groups by
+payer / owner / product / day-range, sums all cost columns, and writes the
+aggregated CSV to COS.
 
 ## What it does
 
 ```
-COS source bucket                 COS dest bucket
-  monthly-bill-details.zip  ──>  aggregated-bills/
-  (built-in bill export)         202607-bill_aggregated.csv
-        │
-        └── COS trigger ──> SCF (index.py)
-                              groups by: Payer Account ID, Owner Account ID,
-                                         ProductName, BillingMode, Region,
-                                         InstanceName, TransactionType,
-                                         StartDay, EndDay
-                              sums:      OriginalCost, RI Deduction,
-                                         SP Deduction, Total After Discount,
-                                         Voucher, Tax, Total Cost, ...
+DescribeBillDetail API              SCF                     COS
+  (paginated, component-level)  ──>  index.py  ──PUT──>  aggregated-bills/
+  flattens ComponentSet              (group+sum)          202607_aggregated.csv
 ```
+
+No manual CSV parsing, no dependency on bill export to COS. The SCF calls the
+billing API directly, flattens each detail record's ComponentSet into individual
+rows, then aggregates by:
+
+- Payer Account ID, Owner Account ID, BillingMode, ProductName, Region,
+  InstanceName, TransactionType, StartDay, EndDay
+
+Summed columns: OriginalCost, RI Deduction, SP Deduction, Total After Discount,
+Voucher, Tax, Total Cost Including Tax, and more.
 
 ## Quick start
 
-1. **Enable bill export to COS** in the Billing Center console
-   (Bill Overview → Bill Data Storage → Monthly Bill Details).
-2. **Create two COS buckets** — one for incoming bills, one for output.
-3. **Create a CAM role** with `policy.json` (replace `${...}` placeholders).
-4. **Build the deployment zip:** `bash package.sh`
-5. **Deploy to SCF** — upload `tc-billing-processor.zip`, set runtime to
-   Python 3.9+, handler to `index.main_handler`.
-6. **Set env vars** (see below).
-7. **Add a COS trigger** on the source bucket, suffix filter `.zip`.
+1. **Create a COS bucket** for the aggregated output.
+2. **Create a CAM role** — see `policy.json` (needs `billing:DescribeBillDetail`
+   + `cos:PutObject`). Replace `${...}` placeholders.
+3. **Build the deployment zip:** `bash package.sh`
+4. **Deploy to SCF:**
+   - Upload `tc-billing-processor.zip`
+   - Runtime: Python 3.9+
+   - Handler: `index.main_handler`
+   - Memory: 512 MB | Timeout: 300s
+   - Attach the role from step 2
+5. **Set env vars** (see below).
+6. **Add a Timer trigger** — e.g., `0 3 3 * * *` (3rd of each month at 03:00).
 
 ## Environment variables
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
+| `MONTH` | **Yes** | — | Bill month in `YYYY-MM` format (e.g. `2026-07`) |
 | `DEST_BUCKET` | **Yes** | — | COS bucket for aggregated output |
-| `DEST_REGION` | No | `ap-singapore` | Region of destination bucket |
-| `DEST_KEY_PREFIX` | No | `aggregated-bills/` | Prefix (folder) for output files |
-| `SOURCE_REGION` | No | `DEST_REGION` | Region of source bucket (if different) |
-| `SOURCE_BUCKET` | Timer only | — | Source bucket (timer triggers only) |
-| `SOURCE_KEY` | Timer only | — | Source object key (timer triggers only) |
+| `BILLING_REGION` | No | `ap-singapore` | Billing API region |
+| `DEST_REGION` | No | `BILLING_REGION` | COS region for output |
+| `DEST_KEY_PREFIX` | No | `aggregated-bills/` | Output folder prefix |
+| `PAGE_LIMIT` | No | `1000` | Records per API page |
+
+> Auth is automatic — the SCF execution role injects `TENCENTCLOUD_SECRETID`,
+> `TENCENTCLOUD_SECRETKEY`, and `TENCENTCLOUD_SESSIONTOKEN` at runtime.
+> No need to store credentials in env vars.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `index.py` | SCF handler — stdlib only, no dependencies |
+| `index.py` | SCF handler — API fetch, flatten, aggregate, COS upload |
+| `requirements.txt` | Dependencies (tencentcloud-sdk-python, cos-python-sdk-v5) |
 | `policy.json` | CAM custom policy for the SCF execution role |
 | `deployment.md` | Full step-by-step setup guide |
-| `package.sh` | Build the deployment zip |
-| `requirements.txt` | Empty (stdlib only) — kept for tooling compat |
+| `package.sh` | Build the deployment zip with all dependencies |
+| `.gitignore` | Ignores zips, build artifacts, Python/IDE files |
 
 ## Output CSV columns
 
