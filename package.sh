@@ -34,8 +34,8 @@ cp -r "$SRC_DIR/common" "$BUILD_DIR/tencentcloud/"
 cp -r "$SRC_DIR/billing" "$BUILD_DIR/tencentcloud/"
 cp -r "$SRC_DIR/region" "$BUILD_DIR/tencentcloud/"
 
-echo "==> Installing requests + deps..."
-pip install --target="$BUILD_DIR" requests >/dev/null 2>&1
+echo "==> Installing requests + deps (urllib3<2 for Python 3.9 compat)..."
+pip install --target="$BUILD_DIR" "requests" "urllib3<2" >/dev/null 2>&1
 
 echo "==> Copying handler..."
 cp index.py "$BUILD_DIR/"
