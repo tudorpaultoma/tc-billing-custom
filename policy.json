@@ -4,7 +4,7 @@
     {
       "effect": "allow",
       "action": [
-        "finance:DescribeBillDetail"
+        "finance:DescribeBill*"
       ],
       "resource": "*"
     },
@@ -20,10 +20,7 @@
     {
       "effect": "allow",
       "action": [
-        "cls:CreateLogset",
-        "cls:CreateTopic",
-        "cls:PutLogs",
-        "cls:SearchLog"
+        "cls:*"
       ],
       "resource": "*"
     }
