@@ -20,6 +20,7 @@ import os
 import logging
 from datetime import datetime
 from collections import defaultdict
+from typing import List, Dict, Tuple, Optional
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
@@ -136,7 +137,7 @@ def date_str_from_timestamp(ts: str) -> str:
     return str(ts)[:10]
 
 
-def extract_tags(tags: list | None) -> dict:
+def extract_tags(tags: Optional[List[dict]]) -> Dict[str, str]:
     """
     Convert the Tags array from the API into a flat dict.
     Input:  [{"TagKey": "Country", "TagValue": "US"}, ...]
@@ -181,7 +182,7 @@ def get_credential():
 # DescribeBillDetail — paginated fetch
 # ---------------------------------------------------------------------------
 
-def fetch_all_bill_details(client, month: str) -> list[dict]:
+def fetch_all_bill_details(client, month: str) -> List[dict]:
     """
     Paginate through DescribeBillDetail for the given month.
     Returns a list of raw BillDetail dicts (flattened from the SDK objects).
@@ -288,7 +289,7 @@ def _bill_detail_to_dict(item) -> dict:
 # Flatten: one BillDetail → N rows (one per component)
 # ---------------------------------------------------------------------------
 
-def flatten_details(details: list[dict]) -> list[dict]:
+def flatten_details(details: List[dict]) -> List[dict]:
     """
     Expand each BillDetail into one row per component in its ComponentSet.
     """
@@ -357,9 +358,9 @@ def flatten_details(details: list[dict]) -> list[dict]:
 # Aggregation
 # ---------------------------------------------------------------------------
 
-def aggregate(rows: list[dict]) -> list[dict]:
+def aggregate(rows: List[dict]) -> List[dict]:
     """Group rows by GROUP_COLUMNS and aggregate numeric columns."""
-    groups: dict[tuple, dict] = {}
+    groups: Dict[Tuple, dict] = {}
 
     for row in rows:
         key_parts = tuple(str(row.get(col, "")).strip() for col in GROUP_COLUMNS)
@@ -393,7 +394,7 @@ def aggregate(rows: list[dict]) -> list[dict]:
 # CSV serialisation
 # ---------------------------------------------------------------------------
 
-def write_csv(rows: list[dict]) -> bytes:
+def write_csv(rows: List[dict]) -> bytes:
     """Serialize aggregated rows to CSV bytes (UTF-8 with BOM for Excel)."""
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=OUTPUT_COLUMNS, extrasaction="ignore")
