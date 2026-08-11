@@ -26,7 +26,7 @@ Voucher, Tax, Total Cost Including Tax, and more.
 ## Quick start
 
 1. **Create a COS bucket** for the aggregated output.
-2. **Create a CAM role** — see `policy.json` (needs `billing:DescribeBillDetail`
+2. **Create a CAM role** — see `policy.json` (needs `finance:DescribeBillDetail`
    + `cos:PutObject`). Replace `${...}` placeholders.
 3. **Build the deployment zip:** `bash package.sh`
 4. **Deploy to SCF:**

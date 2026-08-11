@@ -4,7 +4,7 @@
     {
       "effect": "allow",
       "action": [
-        "billing:DescribeBillDetail"
+        "finance:DescribeBillDetail"
       ],
       "resource": "*"
     },

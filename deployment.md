@@ -30,7 +30,7 @@ Replace `${region}`, `${appid}`, `${dest-bucket}` with your actual values.
   "statement": [
     {
       "effect": "allow",
-      "action": ["billing:DescribeBillDetail"],
+      "action": ["finance:DescribeBillDetail"],
       "resource": "*"
     },
     {
