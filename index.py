@@ -413,31 +413,42 @@ def write_csv(rows: List[dict]) -> bytes:
 COS_ENDPOINT = "https://{bucket}.cos.{region}.myqcloud.com/{key}"
 
 
+def _cos_url_encode(s: str) -> str:
+    """URL-encode for COS v5 signing. Encodes !'()* and other special chars."""
+    return quote(str(s), safe="-_.~")
+
+
 def _cos_sign(secret_id: str, secret_key: str, method: str, path: str,
-              headers: Dict[str, str]) -> str:
+              sign_headers: Dict[str, str]) -> str:
     """
-    Generate COS v5 Authorization header value (q-sign-algorithm=sha1).
+    Generate COS v5 Authorization header value.
     See: https://www.tencentcloud.com/document/product/436/7778
     """
     now = int(datetime.now(timezone.utc).timestamp())
     key_time = f"{now};{now + 600}"
 
-    # Canonical headers: lowercase keys, sorted, "k=v\n" joined
-    sorted_headers = sorted((k.lower(), v) for k, v in headers.items())
-    header_list = ";".join(k for k, _ in sorted_headers)
-    header_str = "".join(f"{k}={v}\n" for k, v in sorted_headers)
+    # Encode and sort header keys+values
+    encoded = []
+    for k, v in sign_headers.items():
+        ek = _cos_url_encode(k).lower()
+        ev = _cos_url_encode(v)
+        encoded.append((ek, ev))
+    encoded.sort(key=lambda x: x[0])
 
-    # Format string: method\npath\nparams(empty)\nheaders\n
-    format_string = f"{method.lower()}\n{path}\n\n{header_str}\n"
+    header_list = ";".join(k for k, _ in encoded)
+    http_headers = "&".join(f"{k}={v}" for k, v in encoded)
 
-    # String to sign: sha1\nkeytime\nsha1(format_string)\n
-    fmt_sha1 = hashlib.sha1(format_string.encode()).hexdigest()
-    string_to_sign = f"sha1\n{key_time}\n{fmt_sha1}\n"
+    # HttpString: method\npath\nparams(empty)\nheaders\n
+    http_string = f"{method.lower()}\n{path}\n\n{http_headers}\n"
 
-    # Sign key = HMAC-SHA1(secret_key, key_time)
+    # StringToSign: sha1\nkeytime\nsha1(httpstring)\n
+    http_sha1 = hashlib.sha1(http_string.encode()).hexdigest()
+    string_to_sign = f"sha1\n{key_time}\n{http_sha1}\n"
+
+    # SignKey = HMAC-SHA1(secret_key, key_time)
     sign_key = hmac.new(secret_key.encode(), key_time.encode(),
                         hashlib.sha1).hexdigest()
-    # Signature = HMAC-SHA1(sign_key, string_to_sign)
+    # Signature = HMAC-SHA1(signKey, stringToSign)
     signature = hmac.new(sign_key.encode(), string_to_sign.encode(),
                          hashlib.sha1).hexdigest()
 
@@ -457,6 +468,8 @@ def upload_to_cos(bucket: str, region: str, key: str, body: bytes):
     Upload bytes to COS via HTTP PUT with v5 HMAC-SHA1 authentication.
     Uses temporary credentials from SCF execution role.
     """
+    from urllib.error import HTTPError
+
     secret_id = os.environ.get("TENCENTCLOUD_SECRETID", "")
     secret_key = os.environ.get("TENCENTCLOUD_SECRETKEY", "")
     token = os.environ.get("TENCENTCLOUD_SESSIONTOKEN", "")
@@ -466,36 +479,50 @@ def upload_to_cos(bucket: str, region: str, key: str, body: bytes):
             "No COS credentials. Attach an execution role to the SCF."
         )
 
-    # URL-encode the key (COS requires this)
+    # URL-encode the key for the URL, but use DECODED path for signing
     encoded_key = quote(key, safe="/")
     url = COS_ENDPOINT.format(bucket=bucket, region=region, key=encoded_key)
-    path = f"/{encoded_key}"
+    host = f"{bucket}.cos.{region}.myqcloud.com"
 
-    # Build headers (include token for temp credentials)
-    headers = {
-        "Content-Type": "text/csv",
-        "Content-Length": str(len(body)),
+    # Headers to sign (must include host; values must match what's sent)
+    sign_headers = {
+        "host": host,
+        "content-type": "text/csv",
     }
     if token:
-        headers["x-cos-security-token"] = token
+        sign_headers["x-cos-security-token"] = token
 
-    # Sign the request
-    auth = _cos_sign(secret_id, secret_key, "PUT", path, headers)
-    headers["Authorization"] = auth
+    # Sign the request (path is the decoded form per COS docs)
+    auth = _cos_sign(secret_id, secret_key, "PUT", f"/{key}", sign_headers)
 
     logger.info("Uploading %d bytes to cos://%s/%s", len(body), bucket, key)
 
     req = Request(url, data=body, method="PUT")
-    for k, v in headers.items():
-        req.add_header(k, v)
+    req.add_header("Host", host)
+    req.add_header("Content-Type", "text/csv")
+    req.add_header("Content-Length", str(len(body)))
+    if token:
+        req.add_header("x-cos-security-token", token)
+    req.add_header("Authorization", auth)
 
     try:
         with urlopen(req, timeout=120) as resp:
             if resp.status not in (200, 204):
                 body_text = resp.read().decode("utf-8", errors="replace")
                 raise RuntimeError(
-                    f"COS PUT failed: HTTP {resp.status} — {body_text[:500]}"
+                    f"COS PUT failed: HTTP {resp.status} — {body_text[:1000]}"
                 )
+    except HTTPError as e:
+        # Capture the COS error response body for debugging
+        error_body = ""
+        try:
+            error_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"COS upload failed for {key}: HTTP {e.code} {e.reason} "
+            f"— Response: {error_body[:1000]}"
+        )
     except URLError as e:
         raise RuntimeError(f"COS upload failed for {key}: {e}")
     logger.info("COS upload complete")
