@@ -17,12 +17,15 @@ import csv
 import io
 import json
 import os
+import hmac
+import hashlib
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
 from typing import List, Dict, Tuple, Optional
 from urllib.request import Request, urlopen
 from urllib.error import URLError
+from urllib.parse import quote, urlparse
 
 from tencentcloud.common import credential
 from tencentcloud.common.profile.client_profile import ClientProfile
@@ -44,10 +47,10 @@ DEST_BUCKET     = os.environ.get("DEST_BUCKET", "")
 DEST_REGION     = os.environ.get("DEST_REGION", BILLING_REGION)
 DEST_KEY_PREFIX = os.environ.get("DEST_KEY_PREFIX", "aggregated-bills/")
 
-# API pagination — DescribeBillDetail returns max 1000 records per call.
-# 300s timeout allows ~100+ pages, enough for bills with tens of thousands
+# API pagination — intl DescribeBillDetail endpoint allows max 300 per page.
+# 300s timeout allows ~300+ pages, enough for bills with tens of thousands
 # of detail records (each of which may expand into multiple component rows).
-PAGE_LIMIT      = int(os.environ.get("PAGE_LIMIT", "1000"))
+PAGE_LIMIT      = int(os.environ.get("PAGE_LIMIT", "300"))
 
 # ---------------------------------------------------------------------------
 # Columns that define a group (each unique combination = one output row)
@@ -404,22 +407,88 @@ def write_csv(rows: List[dict]) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# COS upload
+# COS upload (with v5 HMAC-SHA1 authentication)
 # ---------------------------------------------------------------------------
 
 COS_ENDPOINT = "https://{bucket}.cos.{region}.myqcloud.com/{key}"
 
 
+def _cos_sign(secret_id: str, secret_key: str, method: str, path: str,
+              headers: Dict[str, str]) -> str:
+    """
+    Generate COS v5 Authorization header value (q-sign-algorithm=sha1).
+    See: https://www.tencentcloud.com/document/product/436/7778
+    """
+    now = int(datetime.now(timezone.utc).timestamp())
+    key_time = f"{now};{now + 600}"
+
+    # Canonical headers: lowercase keys, sorted, "k=v\n" joined
+    sorted_headers = sorted((k.lower(), v) for k, v in headers.items())
+    header_list = ";".join(k for k, _ in sorted_headers)
+    header_str = "".join(f"{k}={v}\n" for k, v in sorted_headers)
+
+    # Format string: method\npath\nparams(empty)\nheaders\n
+    format_string = f"{method.lower()}\n{path}\n\n{header_str}\n"
+
+    # String to sign: sha1\nkeytime\nsha1(format_string)\n
+    fmt_sha1 = hashlib.sha1(format_string.encode()).hexdigest()
+    string_to_sign = f"sha1\n{key_time}\n{fmt_sha1}\n"
+
+    # Sign key = HMAC-SHA1(secret_key, key_time)
+    sign_key = hmac.new(secret_key.encode(), key_time.encode(),
+                        hashlib.sha1).hexdigest()
+    # Signature = HMAC-SHA1(sign_key, string_to_sign)
+    signature = hmac.new(sign_key.encode(), string_to_sign.encode(),
+                         hashlib.sha1).hexdigest()
+
+    return (
+        f"q-sign-algorithm=sha1"
+        f"&q-ak={secret_id}"
+        f"&q-sign-time={key_time}"
+        f"&q-key-time={key_time}"
+        f"&q-header-list={header_list}"
+        f"&q-url-param-list="
+        f"&q-signature={signature}"
+    )
+
+
 def upload_to_cos(bucket: str, region: str, key: str, body: bytes):
     """
-    Upload bytes to COS via HTTP PUT.
-    From within SCF, the internal network auto-authenticates requests when
-    the execution role has cos:PutObject on the target bucket.
+    Upload bytes to COS via HTTP PUT with v5 HMAC-SHA1 authentication.
+    Uses temporary credentials from SCF execution role.
     """
-    url = COS_ENDPOINT.format(bucket=bucket, region=region, key=key)
-    logger.info("Uploading %d bytes to %s", len(body), url)
+    secret_id = os.environ.get("TENCENTCLOUD_SECRETID", "")
+    secret_key = os.environ.get("TENCENTCLOUD_SECRETKEY", "")
+    token = os.environ.get("TENCENTCLOUD_SESSIONTOKEN", "")
+
+    if not secret_id or not secret_key:
+        raise RuntimeError(
+            "No COS credentials. Attach an execution role to the SCF."
+        )
+
+    # URL-encode the key (COS requires this)
+    encoded_key = quote(key, safe="/")
+    url = COS_ENDPOINT.format(bucket=bucket, region=region, key=encoded_key)
+    path = f"/{encoded_key}"
+
+    # Build headers (include token for temp credentials)
+    headers = {
+        "Content-Type": "text/csv",
+        "Content-Length": str(len(body)),
+    }
+    if token:
+        headers["x-cos-security-token"] = token
+
+    # Sign the request
+    auth = _cos_sign(secret_id, secret_key, "PUT", path, headers)
+    headers["Authorization"] = auth
+
+    logger.info("Uploading %d bytes to cos://%s/%s", len(body), bucket, key)
+
     req = Request(url, data=body, method="PUT")
-    req.add_header("Content-Type", "text/csv")
+    for k, v in headers.items():
+        req.add_header(k, v)
+
     try:
         with urlopen(req, timeout=120) as resp:
             if resp.status not in (200, 204):
