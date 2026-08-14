@@ -1,0 +1,228 @@
+# Column configuration for the billing aggregation SCF.
+#
+# Format:  <column name> = IN | OUT   (also accepted: <column name>,IN  or  <column name> OUT)
+#   IN  = include this column in the output CSV
+#   OUT = exclude it
+# Lines starting with # are ignored. Blank lines are ignored.
+#
+# Columns NOT listed here keep their built-in default (shown below).
+# To use this file: put it in COS and set CONFIG_BUCKET + CONFIG_KEY,
+# or paste its lines into the COLUMN_CONFIG environment variable.
+#
+# Every available column is listed with its default and kind.
+# To enable an opt-in column, uncomment it (change #Col to Col).
+# To drop a default column, set it to OUT.
+
+# [default group key]
+Payer Account ID = IN
+
+# [default group key]
+Owner Account ID = IN
+
+# [default group key]
+BillingMode = IN
+
+# [default group key]
+ProductName = IN
+
+# [default group key]
+Region = IN
+
+# [default group key]
+InstanceName = IN
+
+# [default group key]
+TransactionType = IN
+
+# [default group key]
+StartDay = IN
+
+# [default group key]
+EndDay = IN
+
+# [default pass-through]
+Component Contracted Price = IN
+
+# [default pass-through]
+Component Price Measurement Unit = IN
+
+# [default pass-through]
+Component Usage Unit = IN
+
+# [default pass-through]
+SP Deduction Rate = IN
+
+# [default pass-through]
+Discount Multiplier = IN
+
+# [default pass-through]
+Blended Discount Multiplier = IN
+
+# [default pass-through]
+Currency = IN
+
+# [default pass-through]
+TaxRate = IN
+
+# [default pass-through]
+Product Code = IN
+
+# [default pass-through]
+Bill Month = IN
+
+# [default summed]
+Component Usage = IN
+
+# [default summed]
+OriginalCost = IN
+
+# [default summed]
+RI Deduction (Duration) = IN
+
+# [default summed]
+RI Deduction (Cost) = IN
+
+# [default summed]
+SP Deduction = IN
+
+# [default summed]
+SP Deduction(Cost) = IN
+
+# [default summed]
+Total Amount After Discount (Excluding Tax) = IN
+
+# [default summed]
+Voucher Deduction = IN
+
+# [default summed]
+Amount Before Tax = IN
+
+# [default summed]
+TaxAmount = IN
+
+# [default summed]
+Total Cost (Including Tax) = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#SubProductName = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Subproduct Code = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#ProjectName = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#ZoneName = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#ResourceId = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Operator Account ID = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Transaction Type Code = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Region ID = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Project ID = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Transaction ID = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Order ID = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Transaction Time = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Fee Begin Time = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Fee End Time = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Billing Day = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Region Type = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Region Type Name = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Remark = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Calculation Formula = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Billing Rules URL = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Discount Object = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Discount Type = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Discount Content = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Billing Record ID = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Component Type = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Component Name = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Component List Price = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Specified Price = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Component Code = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Item Code = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Instance Type = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Offer Type = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Duration Unit = IN
+
+# [opt-in  pass-through]  uncomment to enable:
+#Component Config = IN
+
+# [opt-in  summed]  uncomment to enable:
+#Original Usage/Duration = IN
+
+# [opt-in  summed]  uncomment to enable:
+#Deducted Usage/Duration = IN
+
+# [opt-in  summed]  uncomment to enable:
+#Usage Duration = IN
+
+# [opt-in  summed]  uncomment to enable:
+#Free Credit (Incentive) = IN
+
+# [opt-in  summed]  uncomment to enable:
+#Royalty (Transfer) = IN
+
+# --- Tags ---
+# Tags are dynamic: any tag key on a resource becomes a column tag_key:<Key>.
+# By default only Country / GroupName / Type are included.
+# Use tag_key:* = IN to include every tag found, or list specific ones:
+#   tag_key:Environment = IN
+#   tag_key:Team = OUT

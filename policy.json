@@ -11,7 +11,8 @@
     {
       "effect": "allow",
       "action": [
-        "cos:PutObject"
+        "cos:PutObject",
+        "cos:GetObject"
       ],
       "resource": [
         "qcs::cos:${region}:uid/${appid}:${dest-bucket}/*"

@@ -1,7 +1,7 @@
 """
 Tencent Cloud Billing Aggregation SCF
 Pulls monthly bill detail via DescribeBillDetail API (billing SDK),
-flattens ComponentSet, groups by specified dimensions, aggregates cost
+flattens ComponentSet, groups by configurable dimensions, aggregates cost
 columns, and writes the aggregated CSV to COS.
 
 Trigger: Timer (monthly cron) or manual invocation via API Gateway.
@@ -9,8 +9,16 @@ Auth:    Auto-detected from SCF runtime env vars
          (TENCENTCLOUD_SECRETID / TENCENTCLOUD_SECRETKEY /
           TENCENTCLOUD_SESSIONTOKEN) provided by the execution role.
 
-Dependencies: tencentcloud-sdk-python (billing). COS upload uses stdlib urllib
-              (SCF internal network auto-authenticates via execution role).
+Column selection is configurable. The FIELD_CATALOG below is the single
+source of truth: it lists every extractable column, its kind (group / sum /
+pass-through) and whether it is included by default. A text config (env var
+or a COS object) can override any column with IN / OUT, e.g.:
+
+    ZoneName = IN
+    OriginalCost = OUT
+
+Dependencies: tencentcloud-sdk-python (billing). COS upload/download uses
+              stdlib urllib with v5 HMAC-SHA1 signing.
 """
 
 import csv
@@ -21,11 +29,10 @@ import hmac
 import hashlib
 import logging
 from datetime import datetime, timezone
-from collections import defaultdict
 from typing import List, Dict, Tuple, Optional
 from urllib.request import Request, urlopen
-from urllib.error import URLError
-from urllib.parse import quote, urlparse
+from urllib.error import URLError, HTTPError
+from urllib.parse import quote
 
 from tencentcloud.common import credential
 from tencentcloud.common.profile.client_profile import ClientProfile
@@ -47,64 +54,117 @@ DEST_BUCKET     = os.environ.get("DEST_BUCKET", "")
 DEST_REGION     = os.environ.get("DEST_REGION", BILLING_REGION)
 DEST_KEY_PREFIX = os.environ.get("DEST_KEY_PREFIX", "aggregated-bills/")
 
+# Column config sources (all optional; built-in defaults apply otherwise).
+COLUMN_CONFIG   = os.environ.get("COLUMN_CONFIG", "")      # inline config text
+CONFIG_BUCKET   = os.environ.get("CONFIG_BUCKET", "")      # COS bucket holding config
+CONFIG_KEY      = os.environ.get("CONFIG_KEY", "")         # COS object key (path)
+CONFIG_REGION   = os.environ.get("CONFIG_REGION", DEST_REGION)
+
 # API pagination — intl DescribeBillDetail endpoint allows max 300 per page.
-# 300s timeout allows ~300+ pages, enough for bills with tens of thousands
-# of detail records (each of which may expand into multiple component rows).
 PAGE_LIMIT      = int(os.environ.get("PAGE_LIMIT", "300"))
 
-# ---------------------------------------------------------------------------
-# Columns that define a group (each unique combination = one output row)
-# ---------------------------------------------------------------------------
-GROUP_COLUMNS = [
-    "Payer Account ID",
-    "Owner Account ID",
-    "BillingMode",
-    "ProductName",
-    "Region",
-    "InstanceName",
-    "TransactionType",
-    "StartDay",
-    "EndDay",
-]
 
 # ---------------------------------------------------------------------------
-# Numeric columns to SUM within each group
+# Field catalog — the single source of truth for every extractable column.
+#
+#   col     : output CSV column name (what appears as a header / in config)
+#   kind    : "group" (defines a row), "sum" (numeric aggregate),
+#             "pass" (first non-empty value per group)
+#   level   : "top" (BillDetail field), "component" (BillDetailComponent field),
+#             "derived" (computed from other fields)
+#   field   : raw API attribute name (None for derived)
+#   default : "IN" (included by default) or "OUT" (opt-in via config)
+#
+# The default set below reproduces the original fixed columns. Everything
+# marked OUT can be enabled via the column config (see README).
 # ---------------------------------------------------------------------------
-SUM_COLUMNS = [
-    "Component Usage",
-    "OriginalCost",
-    "RI Deduction (Duration)",
-    "RI Deduction (Cost)",
-    "SP Deduction",
-    "SP Deduction(Cost)",
-    "Total Amount After Discount (Excluding Tax)",
-    "Voucher Deduction",
-    "Amount Before Tax",
-    "TaxAmount",
-    "Total Cost (Including Tax)",
+FIELD_CATALOG = [
+    # --- Group dimensions (one output row per unique combination) ---
+    {"col": "Payer Account ID",   "kind": "group", "level": "top",      "field": "PayerUin",         "default": "IN"},
+    {"col": "Owner Account ID",   "kind": "group", "level": "top",      "field": "OwnerUin",         "default": "IN"},
+    {"col": "BillingMode",        "kind": "group", "level": "top",      "field": "PayModeName",      "default": "IN"},
+    {"col": "ProductName",        "kind": "group", "level": "top",      "field": "BusinessCodeName", "default": "IN"},
+    {"col": "Region",             "kind": "group", "level": "top",      "field": "RegionName",       "default": "IN"},
+    {"col": "InstanceName",       "kind": "group", "level": "top",      "field": "ResourceName",     "default": "IN"},
+    {"col": "TransactionType",    "kind": "group", "level": "top",      "field": "ActionTypeName",   "default": "IN"},
+    {"col": "StartDay",           "kind": "group", "level": "derived",  "field": None,               "default": "IN"},
+    {"col": "EndDay",             "kind": "group", "level": "derived",  "field": None,               "default": "IN"},
+
+    # --- Pass-through columns (first value per group), included by default ---
+    {"col": "Component Contracted Price",            "kind": "pass", "level": "component", "field": "ContractPrice",     "default": "IN"},
+    {"col": "Component Price Measurement Unit",      "kind": "pass", "level": "component", "field": "PriceUnit",         "default": "IN"},
+    {"col": "Component Usage Unit",                  "kind": "pass", "level": "component", "field": "UsedAmountUnit",    "default": "IN"},
+    {"col": "SP Deduction Rate",                     "kind": "pass", "level": "component", "field": "SPDeductionRate",   "default": "IN"},
+    {"col": "Discount Multiplier",                   "kind": "pass", "level": "component", "field": "Discount",          "default": "IN"},
+    {"col": "Blended Discount Multiplier",           "kind": "pass", "level": "component", "field": "BlendedDiscount",   "default": "IN"},
+    {"col": "Currency",                              "kind": "pass", "level": "component", "field": "Currency",          "default": "IN"},
+    {"col": "TaxRate",                               "kind": "pass", "level": "component", "field": "TaxRate",           "default": "IN"},
+    {"col": "Product Code",                          "kind": "pass", "level": "top",       "field": "BusinessCode",     "default": "IN"},
+    {"col": "Bill Month",                            "kind": "pass", "level": "top",       "field": "BillMonth",        "default": "IN"},
+
+    # --- Summed columns, included by default ---
+    {"col": "Component Usage",                       "kind": "sum",  "level": "component", "field": "UsedAmount",       "default": "IN"},
+    {"col": "OriginalCost",                          "kind": "sum",  "level": "component", "field": "Cost",             "default": "IN"},
+    {"col": "RI Deduction (Duration)",               "kind": "sum",  "level": "component", "field": "RiTimeSpan",        "default": "IN"},
+    {"col": "RI Deduction (Cost)",                   "kind": "sum",  "level": "component", "field": "OriginalCostWithRI", "default": "IN"},
+    {"col": "SP Deduction",                          "kind": "sum",  "level": "component", "field": "SPDeduction",       "default": "IN"},
+    {"col": "SP Deduction(Cost)",                    "kind": "sum",  "level": "component", "field": "OriginalCostWithSP", "default": "IN"},
+    {"col": "Total Amount After Discount (Excluding Tax)", "kind": "sum", "level": "component", "field": "RealCost",     "default": "IN"},
+    {"col": "Voucher Deduction",                     "kind": "sum",  "level": "component", "field": "VoucherPayAmount",  "default": "IN"},
+    {"col": "Amount Before Tax",                     "kind": "sum",  "level": "component", "field": "CashPayAmount",     "default": "IN"},
+    {"col": "TaxAmount",                             "kind": "sum",  "level": "component", "field": "TaxAmount",         "default": "IN"},
+    {"col": "Total Cost (Including Tax)",            "kind": "sum",  "level": "derived",  "field": None,               "default": "IN"},
+
+    # --- Extra top-level fields (opt-in via config) ---
+    {"col": "SubProductName",        "kind": "pass", "level": "top", "field": "ProductCodeName", "default": "OUT"},
+    {"col": "Subproduct Code",       "kind": "pass", "level": "top", "field": "ProductCode",     "default": "OUT"},
+    {"col": "ProjectName",           "kind": "pass", "level": "top", "field": "ProjectName",     "default": "OUT"},
+    {"col": "ZoneName",              "kind": "pass", "level": "top", "field": "ZoneName",        "default": "OUT"},
+    {"col": "ResourceId",            "kind": "pass", "level": "top", "field": "ResourceId",      "default": "OUT"},
+    {"col": "Operator Account ID",   "kind": "pass", "level": "top", "field": "OperateUin",      "default": "OUT"},
+    {"col": "Transaction Type Code", "kind": "pass", "level": "top", "field": "ActionType",      "default": "OUT"},
+    {"col": "Region ID",             "kind": "pass", "level": "top", "field": "RegionId",        "default": "OUT"},
+    {"col": "Project ID",            "kind": "pass", "level": "top", "field": "ProjectId",       "default": "OUT"},
+    {"col": "Transaction ID",        "kind": "pass", "level": "top", "field": "BillId",          "default": "OUT"},
+    {"col": "Order ID",              "kind": "pass", "level": "top", "field": "OrderId",         "default": "OUT"},
+    {"col": "Transaction Time",      "kind": "pass", "level": "top", "field": "PayTime",         "default": "OUT"},
+    {"col": "Fee Begin Time",        "kind": "pass", "level": "top", "field": "FeeBeginTime",    "default": "OUT"},
+    {"col": "Fee End Time",          "kind": "pass", "level": "top", "field": "FeeEndTime",      "default": "OUT"},
+    {"col": "Billing Day",           "kind": "pass", "level": "top", "field": "BillDay",         "default": "OUT"},
+    {"col": "Region Type",           "kind": "pass", "level": "top", "field": "RegionType",      "default": "OUT"},
+    {"col": "Region Type Name",      "kind": "pass", "level": "top", "field": "RegionTypeName",  "default": "OUT"},
+    {"col": "Remark",                "kind": "pass", "level": "top", "field": "ReserveDetail",   "default": "OUT"},
+    {"col": "Calculation Formula",   "kind": "pass", "level": "top", "field": "Formula",         "default": "OUT"},
+    {"col": "Billing Rules URL",     "kind": "pass", "level": "top", "field": "FormulaUrl",      "default": "OUT"},
+    {"col": "Discount Object",       "kind": "pass", "level": "top", "field": "DiscountObject",  "default": "OUT"},
+    {"col": "Discount Type",         "kind": "pass", "level": "top", "field": "DiscountType",    "default": "OUT"},
+    {"col": "Discount Content",      "kind": "pass", "level": "top", "field": "DiscountContent", "default": "OUT"},
+    {"col": "Billing Record ID",     "kind": "pass", "level": "top", "field": "Id",              "default": "OUT"},
+
+    # --- Extra component fields (opt-in via config) ---
+    {"col": "Component Type",           "kind": "pass", "level": "component", "field": "ComponentCodeName", "default": "OUT"},
+    {"col": "Component Name",           "kind": "pass", "level": "component", "field": "ItemCodeName",      "default": "OUT"},
+    {"col": "Component List Price",     "kind": "pass", "level": "component", "field": "SinglePrice",       "default": "OUT"},
+    {"col": "Specified Price",          "kind": "pass", "level": "component", "field": "SpecifiedPrice",    "default": "OUT"},
+    {"col": "Component Code",           "kind": "pass", "level": "component", "field": "ComponentCode",     "default": "OUT"},
+    {"col": "Item Code",                "kind": "pass", "level": "component", "field": "ItemCode",          "default": "OUT"},
+    {"col": "Instance Type",            "kind": "pass", "level": "component", "field": "InstanceType",      "default": "OUT"},
+    {"col": "Offer Type",               "kind": "pass", "level": "component", "field": "ReduceType",        "default": "OUT"},
+    {"col": "Duration Unit",            "kind": "pass", "level": "component", "field": "TimeUnitName",      "default": "OUT"},
+    {"col": "Component Config",         "kind": "pass", "level": "component", "field": "ComponentConfig",   "default": "OUT"},
+    {"col": "Original Usage/Duration",  "kind": "sum",  "level": "component", "field": "RealTotalMeasure",  "default": "OUT"},
+    {"col": "Deducted Usage/Duration",  "kind": "sum",  "level": "component", "field": "DeductedMeasure",    "default": "OUT"},
+    {"col": "Usage Duration",           "kind": "sum",  "level": "component", "field": "TimeSpan",           "default": "OUT"},
+    {"col": "Free Credit (Incentive)",  "kind": "sum",  "level": "component", "field": "IncentivePayAmount", "default": "OUT"},
+    {"col": "Royalty (Transfer)",       "kind": "sum",  "level": "component", "field": "TransferPayAmount",  "default": "OUT"},
 ]
 
-# ---------------------------------------------------------------------------
-# Columns carried forward as-is (first non-empty value wins per group).
-# ---------------------------------------------------------------------------
-PASS_THROUGH_COLUMNS = [
-    "Component Contracted Price",
-    "Component Price Measurement Unit",
-    "Component Usage Unit",
-    "SP Deduction Rate",
-    "Discount Multiplier",
-    "Blended Discount Multiplier",
-    "Currency",
-    "TaxRate",
-    "tag_key:Country",
-    "tag_key:GroupName",
-    "tag_key:Type",
-    "Product Code",
-    "Bill Month",
-]
+# Raw field names per level, used by the generic extractor.
+_TOP_FIELDS   = [e["field"] for e in FIELD_CATALOG if e["level"] == "top"]
+_COMP_FIELDS  = [e["field"] for e in FIELD_CATALOG if e["level"] == "component"]
 
-# Full output column order
-OUTPUT_COLUMNS = GROUP_COLUMNS + PASS_THROUGH_COLUMNS + SUM_COLUMNS
+# Tag columns included by default when no tag config is supplied (legacy set).
+DEFAULT_TAG_COLUMNS = ["tag_key:Country", "tag_key:GroupName", "tag_key:Type"]
 
 
 # ---------------------------------------------------------------------------
@@ -124,15 +184,6 @@ def safe_float(value) -> float:
         return 0.0
 
 
-def first_non_empty(*values) -> str:
-    """Return the first non-empty, non-None string value."""
-    for v in values:
-        s = str(v).strip() if v is not None else ""
-        if s:
-            return s
-    return ""
-
-
 def date_str_from_timestamp(ts: str) -> str:
     """Extract YYYY-MM-DD from a timestamp string like '2026-07-15 03:42:18'."""
     if not ts:
@@ -140,26 +191,30 @@ def date_str_from_timestamp(ts: str) -> str:
     return str(ts)[:10]
 
 
-def extract_tags(tags: Optional[List[dict]]) -> Dict[str, str]:
-    """
-    Convert the Tags array from the API into a flat dict.
-    Input:  [{"TagKey": "Country", "TagValue": "US"}, ...]
-    Output: {"tag_key:Country": "US", "tag_key:GroupName": "", ...}
-    """
-    result = {
-        "tag_key:Country": "",
-        "tag_key:GroupName": "",
-        "tag_key:Type": "",
-    }
-    if not tags:
-        return result
-    for tag in tags:
-        key = tag.get("TagKey", "")
-        val = tag.get("TagValue", "")
-        mapped = f"tag_key:{key}"
-        if mapped in result:
-            result[mapped] = val
-    return result
+def _derived_start_day(d: dict, comp: dict) -> str:
+    return date_str_from_timestamp(d.get("FeeBeginTime", ""))
+
+
+def _derived_end_day(d: dict, comp: dict) -> str:
+    return date_str_from_timestamp(d.get("FeeEndTime", ""))
+
+
+def _derived_total_with_tax(d: dict, comp: dict) -> float:
+    """Total cost including tax = cash + incentive + transfer + voucher + tax."""
+    cash = safe_float(comp.get("CashPayAmount", 0))
+    incentive = safe_float(comp.get("IncentivePayAmount", 0))
+    transfer = safe_float(comp.get("TransferPayAmount", 0))
+    voucher = safe_float(comp.get("VoucherPayAmount", 0))
+    tax = safe_float(comp.get("TaxAmount", 0))
+    return cash + incentive + transfer + voucher + tax
+
+
+# Map derived column name -> computor(dict, component_dict).
+_DERIVED = {
+    "StartDay": _derived_start_day,
+    "EndDay": _derived_end_day,
+    "Total Cost (Including Tax)": _derived_total_with_tax,
+}
 
 
 def get_credential():
@@ -210,7 +265,6 @@ def fetch_all_bill_details(client, month: str) -> List[dict]:
         if not detail_set:
             break
 
-        # Flatten SDK objects to plain dicts for later processing
         for item in detail_set:
             all_details.append(_bill_detail_to_dict(item))
 
@@ -227,164 +281,208 @@ def fetch_all_bill_details(client, month: str) -> List[dict]:
 
 
 def _bill_detail_to_dict(item) -> dict:
-    """Convert a BillDetail SDK object into a plain dict, nesting ComponentSet."""
+    """
+    Convert a BillDetail SDK object into a plain dict, extracting every field
+    listed in FIELD_CATALOG (top-level) plus the full ComponentSet and Tags.
+    Missing attributes map to "" via getattr.
+    """
+    d = {f: (getattr(item, f, "") or "") for f in _TOP_FIELDS}
+
     components = []
-    if item.ComponentSet:
-        for comp in item.ComponentSet:
-            components.append({
-                "ComponentCodeName": getattr(comp, "ComponentCodeName", "") or "",
-                "ItemCodeName": getattr(comp, "ItemCodeName", "") or "",
-                "SinglePrice": getattr(comp, "SinglePrice", "") or "",
-                "PriceUnit": getattr(comp, "PriceUnit", "") or "",
-                "UsedAmount": getattr(comp, "UsedAmount", "") or "",
-                "UsedAmountUnit": getattr(comp, "UsedAmountUnit", "") or "",
-                "Cost": getattr(comp, "Cost", "") or "",
-                "Discount": getattr(comp, "Discount", "") or "",
-                "ReduceType": getattr(comp, "ReduceType", "") or "",
-                "RealCost": getattr(comp, "RealCost", "") or "",
-                "VoucherPayAmount": getattr(comp, "VoucherPayAmount", "") or "",
-                "CashPayAmount": getattr(comp, "CashPayAmount", "") or "",
-                "IncentivePayAmount": getattr(comp, "IncentivePayAmount", "") or "",
-                "TransferPayAmount": getattr(comp, "TransferPayAmount", "") or "",
-                "ContractPrice": getattr(comp, "ContractPrice", "") or "",
-                "RiTimeSpan": getattr(comp, "RiTimeSpan", "") or "",
-                "OriginalCostWithRI": getattr(comp, "OriginalCostWithRI", "") or "",
-                "SPDeductionRate": getattr(comp, "SPDeductionRate", "") or "",
-                "OriginalCostWithSP": getattr(comp, "OriginalCostWithSP", "") or "",
-                "BlendedDiscount": getattr(comp, "BlendedDiscount", "") or "",
-                "TaxRate": getattr(comp, "TaxRate", "") or "",
-                "TaxAmount": getattr(comp, "TaxAmount", "") or "",
-                "Currency": getattr(comp, "Currency", "") or "",
-            })
+    for comp in (getattr(item, "ComponentSet", None) or []):
+        components.append({f: (getattr(comp, f, "") or "") for f in _COMP_FIELDS})
+    d["ComponentSet"] = components
 
-    # Tags
-    tags = []
-    if getattr(item, "Tags", None):
-        for t in item.Tags:
-            tags.append({
-                "TagKey": getattr(t, "TagKey", "") or "",
-                "TagValue": getattr(t, "TagValue", "") or "",
-            })
-
-    return {
-        "PayerUin": getattr(item, "PayerUin", "") or "",
-        "OwnerUin": getattr(item, "OwnerUin", "") or "",
-        "BusinessCodeName": getattr(item, "BusinessCodeName", "") or "",
-        "ProductCodeName": getattr(item, "ProductCodeName", "") or "",
-        "PayModeName": getattr(item, "PayModeName", "") or "",
-        "ProjectName": getattr(item, "ProjectName", "") or "",
-        "RegionName": getattr(item, "RegionName", "") or "",
-        "ZoneName": getattr(item, "ZoneName", "") or "",
-        "ResourceId": getattr(item, "ResourceId", "") or "",
-        "ResourceName": getattr(item, "ResourceName", "") or "",
-        "ActionTypeName": getattr(item, "ActionTypeName", "") or "",
-        "FeeBeginTime": getattr(item, "FeeBeginTime", "") or "",
-        "FeeEndTime": getattr(item, "FeeEndTime", "") or "",
-        "BusinessCode": getattr(item, "BusinessCode", "") or "",
-        "ProductCode": getattr(item, "ProductCode", "") or "",
-        "BillMonth": getattr(item, "BillMonth", "") or "",
-        "ComponentSet": components,
-        "Tags": tags,
-    }
+    d["Tags"] = [
+        {"TagKey": getattr(t, "TagKey", "") or "",
+         "TagValue": getattr(t, "TagValue", "") or ""}
+        for t in (getattr(item, "Tags", None) or [])
+    ]
+    return d
 
 
 # ---------------------------------------------------------------------------
-# Flatten: one BillDetail → N rows (one per component)
+# Column resolution (catalog + config overrides)
 # ---------------------------------------------------------------------------
 
-def flatten_details(details: List[dict]) -> List[dict]:
+def parse_column_config(text: str) -> Dict[str, str]:
+    """
+    Parse a config text into {column_name: "IN"|"OUT"} overrides.
+
+    Accepted line forms (comments start with #):
+        ZoneName = IN
+        ZoneName,IN
+        ZoneName IN
+    The last token must be IN or OUT (case-insensitive).
+    """
+    overrides: Dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        if "=" in line:
+            col, _, val = line.partition("=")
+        elif "," in line:
+            col, _, val = line.partition(",")
+        else:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            col, val = " ".join(parts[:-1]), parts[-1]
+
+        col = col.strip()
+        val = val.strip().upper()
+        if not col or val not in ("IN", "OUT"):
+            logger.warning("Ignoring config line (bad value): %r", raw)
+            continue
+        overrides[col] = val
+    return overrides
+
+
+def resolve_fixed_columns(overrides: Dict[str, str]) -> Tuple[List[str], List[str], List[str]]:
+    """Split the catalog into (group, sum, pass) column lists after overrides."""
+    group, sum_cols, pass_cols = [], [], []
+    for entry in FIELD_CATALOG:
+        col = entry["col"]
+        state = overrides.get(col, entry["default"]).upper()
+        if state != "IN":
+            continue
+        kind = entry["kind"]
+        if kind == "group":
+            group.append(col)
+        elif kind == "sum":
+            sum_cols.append(col)
+        else:
+            pass_cols.append(col)
+    return group, sum_cols, pass_cols
+
+
+def discover_tag_keys(details: List[dict]) -> List[str]:
+    """Return sorted 'tag_key:<Key>' column names seen across all records."""
+    keys = set()
+    for d in details:
+        for t in d.get("Tags", []):
+            key = t.get("TagKey", "")
+            if key:
+                keys.add(f"tag_key:{key}")
+    return sorted(keys)
+
+
+def resolve_tag_columns(overrides: Dict[str, str], discovered: List[str]) -> List[str]:
+    """
+    Decide which tag columns to include.
+
+    - No tag config at all  -> legacy default set (Country / GroupName / Type).
+    - "tag_key:* = IN"      -> all discovered tag columns (minus explicit OUTs).
+    - Otherwise             -> only columns explicitly marked IN.
+    """
+    tag_overrides = {k: v for k, v in overrides.items() if k.startswith("tag_key:")}
+    if not tag_overrides:
+        return [c for c in DEFAULT_TAG_COLUMNS if c in discovered]
+
+    include_all = tag_overrides.pop("tag_key:*", "").upper() == "IN"
+    selected = set(discovered) if include_all else set()
+    for k, v in tag_overrides.items():
+        if v.upper() == "IN":
+            selected.add(k)
+        else:
+            selected.discard(k)
+    return sorted(selected)
+
+
+def load_column_overrides() -> Dict[str, str]:
+    """Merge inline (COLUMN_CONFIG) and COS (CONFIG_BUCKET/CONFIG_KEY) overrides."""
+    overrides: Dict[str, str] = {}
+    if COLUMN_CONFIG.strip():
+        overrides.update(parse_column_config(COLUMN_CONFIG))
+
+    if CONFIG_BUCKET and CONFIG_KEY:
+        logger.info("Loading column config from cos://%s/%s", CONFIG_BUCKET, CONFIG_KEY)
+        body = download_from_cos(CONFIG_BUCKET, CONFIG_REGION, CONFIG_KEY)
+        overrides.update(parse_column_config(body.decode("utf-8")))
+
+    return overrides
+
+
+# ---------------------------------------------------------------------------
+# Flatten: one BillDetail -> N rows (one per component)
+# ---------------------------------------------------------------------------
+
+def flatten_details(details: List[dict], tag_columns: List[str]) -> List[dict]:
     """
     Expand each BillDetail into one row per component in its ComponentSet.
+    Every catalog column is emitted (aggregation filters later), plus the
+    requested tag columns.
     """
     rows = []
     for d in details:
-        tags = extract_tags(d.get("Tags", []))
+        tags = extract_tags(d.get("Tags", []), tag_columns)
         components = d.get("ComponentSet", [])
         if not components:
-            # Edge case: no components — still emit a row with empty component fields
             components = [{}]
 
         for comp in components:
-            # Total Cost (Including Tax) = sum of payment amounts + tax
-            cash = safe_float(comp.get("CashPayAmount", 0))
-            incentive = safe_float(comp.get("IncentivePayAmount", 0))
-            transfer = safe_float(comp.get("TransferPayAmount", 0))
-            voucher = safe_float(comp.get("VoucherPayAmount", 0))
-            tax = safe_float(comp.get("TaxAmount", 0))
-            total_with_tax = cash + incentive + transfer + voucher + tax
+            row = {}
+            for entry in FIELD_CATALOG:
+                col = entry["col"]
+                level = entry["level"]
+                if level == "top":
+                    val = d.get(entry["field"], "")
+                elif level == "component":
+                    val = comp.get(entry["field"], "")
+                else:  # derived
+                    val = _DERIVED[col](d, comp)
 
-            row = {
-                # Group keys
-                "Payer Account ID": d.get("PayerUin", ""),
-                "Owner Account ID": d.get("OwnerUin", ""),
-                "BillingMode": d.get("PayModeName", ""),
-                "ProductName": d.get("BusinessCodeName", ""),
-                "Region": d.get("RegionName", ""),
-                "InstanceName": d.get("ResourceName", ""),
-                "TransactionType": d.get("ActionTypeName", ""),
-                "StartDay": date_str_from_timestamp(d.get("FeeBeginTime", "")),
-                "EndDay": date_str_from_timestamp(d.get("FeeEndTime", "")),
-                # Component-level fields
-                "Component Contracted Price": comp.get("ContractPrice", ""),
-                "Component Price Measurement Unit": comp.get("PriceUnit", ""),
-                "Component Usage": safe_float(comp.get("UsedAmount", 0)),
-                "Component Usage Unit": comp.get("UsedAmountUnit", ""),
-                "OriginalCost": safe_float(comp.get("Cost", 0)),
-                "RI Deduction (Duration)": safe_float(comp.get("RiTimeSpan", 0)),
-                "RI Deduction (Cost)": safe_float(comp.get("OriginalCostWithRI", 0)),
-                # SP Deduction = original SP cost before rate is applied
-                "SP Deduction": safe_float(comp.get("OriginalCostWithSP", 0)),
-                "SP Deduction Rate": comp.get("SPDeductionRate", ""),
-                "SP Deduction(Cost)": safe_float(comp.get("OriginalCostWithSP", 0)),
-                "Discount Multiplier": comp.get("Discount", ""),
-                "Blended Discount Multiplier": comp.get("BlendedDiscount", ""),
-                "Currency": comp.get("Currency", ""),
-                "Total Amount After Discount (Excluding Tax)": safe_float(comp.get("RealCost", 0)),
-                "Voucher Deduction": voucher,
-                "Amount Before Tax": cash,
-                "TaxRate": comp.get("TaxRate", ""),
-                "TaxAmount": tax,
-                "Total Cost (Including Tax)": total_with_tax,
-                # Tags and product metadata
-                "tag_key:Country": tags.get("tag_key:Country", ""),
-                "tag_key:GroupName": tags.get("tag_key:GroupName", ""),
-                "tag_key:Type": tags.get("tag_key:Type", ""),
-                "Product Code": d.get("BusinessCode", ""),
-                "Bill Month": d.get("BillMonth", ""),
-            }
+                row[col] = safe_float(val) if entry["kind"] == "sum" else val
+
+            for tk in tag_columns:
+                row[tk] = tags.get(tk, "")
             rows.append(row)
 
     return rows
+
+
+def extract_tags(tags: Optional[List[dict]], tag_columns: List[str]) -> Dict[str, str]:
+    """Map a Tags array to the requested 'tag_key:<Key>' columns."""
+    result = {tk: "" for tk in tag_columns}
+    if not tags:
+        return result
+    for tag in tags:
+        mapped = f"tag_key:{tag.get('TagKey', '')}"
+        if mapped in result:
+            result[mapped] = tag.get("TagValue", "")
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
 
-def aggregate(rows: List[dict]) -> List[dict]:
-    """Group rows by GROUP_COLUMNS and aggregate numeric columns."""
+def aggregate(rows: List[dict], group_cols: List[str],
+              sum_cols: List[str], pass_cols: List[str]) -> List[dict]:
+    """Group rows by group_cols and aggregate numeric columns."""
     groups: Dict[Tuple, dict] = {}
 
     for row in rows:
-        key_parts = tuple(str(row.get(col, "")).strip() for col in GROUP_COLUMNS)
-        group_key = key_parts
+        key = tuple(str(row.get(col, "")).strip() for col in group_cols)
 
-        if group_key not in groups:
+        if key not in groups:
             entry = {}
-            for col in GROUP_COLUMNS:
+            for col in group_cols:
                 entry[col] = str(row.get(col, "")).strip()
-            for col in PASS_THROUGH_COLUMNS:
+            for col in pass_cols:
                 entry[col] = ""
-            for col in SUM_COLUMNS:
+            for col in sum_cols:
                 entry[col] = 0.0
-            groups[group_key] = entry
+            groups[key] = entry
 
-        grp = groups[group_key]
+        grp = groups[key]
 
-        for col in SUM_COLUMNS:
+        for col in sum_cols:
             grp[col] += safe_float(row.get(col, 0))
 
-        for col in PASS_THROUGH_COLUMNS:
+        for col in pass_cols:
             if not grp.get(col):
                 val = str(row.get(col, "")).strip() if row.get(col) is not None else ""
                 if val:
@@ -397,17 +495,17 @@ def aggregate(rows: List[dict]) -> List[dict]:
 # CSV serialisation
 # ---------------------------------------------------------------------------
 
-def write_csv(rows: List[dict]) -> bytes:
+def write_csv(rows: List[dict], output_columns: List[str]) -> bytes:
     """Serialize aggregated rows to CSV bytes (UTF-8 with BOM for Excel)."""
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=OUTPUT_COLUMNS, extrasaction="ignore")
+    writer = csv.DictWriter(buf, fieldnames=output_columns, extrasaction="ignore")
     writer.writeheader()
     writer.writerows(rows)
     return buf.getvalue().encode("utf-8-sig")
 
 
 # ---------------------------------------------------------------------------
-# COS upload (with v5 HMAC-SHA1 authentication)
+# COS (with v5 HMAC-SHA1 authentication)
 # ---------------------------------------------------------------------------
 
 COS_ENDPOINT = "https://{bucket}.cos.{region}.myqcloud.com/{key}"
@@ -427,7 +525,6 @@ def _cos_sign(secret_id: str, secret_key: str, method: str, path: str,
     now = int(datetime.now(timezone.utc).timestamp())
     key_time = f"{now};{now + 600}"
 
-    # Encode and sort header keys+values
     encoded = []
     for k, v in sign_headers.items():
         ek = _cos_url_encode(k).lower()
@@ -438,17 +535,13 @@ def _cos_sign(secret_id: str, secret_key: str, method: str, path: str,
     header_list = ";".join(k for k, _ in encoded)
     http_headers = "&".join(f"{k}={v}" for k, v in encoded)
 
-    # HttpString: method\npath\nparams(empty)\nheaders\n
     http_string = f"{method.lower()}\n{path}\n\n{http_headers}\n"
 
-    # StringToSign: sha1\nkeytime\nsha1(httpstring)\n
     http_sha1 = hashlib.sha1(http_string.encode()).hexdigest()
     string_to_sign = f"sha1\n{key_time}\n{http_sha1}\n"
 
-    # SignKey = HMAC-SHA1(secret_key, key_time)
     sign_key = hmac.new(secret_key.encode(), key_time.encode(),
                         hashlib.sha1).hexdigest()
-    # Signature = HMAC-SHA1(signKey, stringToSign)
     signature = hmac.new(sign_key.encode(), string_to_sign.encode(),
                          hashlib.sha1).hexdigest()
 
@@ -463,69 +556,70 @@ def _cos_sign(secret_id: str, secret_key: str, method: str, path: str,
     )
 
 
-def upload_to_cos(bucket: str, region: str, key: str, body: bytes):
+def _cos_request(method: str, bucket: str, region: str, key: str,
+                 body: Optional[bytes] = None) -> bytes:
     """
-    Upload bytes to COS via HTTP PUT with v5 HMAC-SHA1 authentication.
-    Uses temporary credentials from SCF execution role.
+    Perform a signed COS request (PUT for upload, GET for download) and
+    return the response body bytes.
     """
-    from urllib.error import HTTPError
-
     secret_id = os.environ.get("TENCENTCLOUD_SECRETID", "")
     secret_key = os.environ.get("TENCENTCLOUD_SECRETKEY", "")
     token = os.environ.get("TENCENTCLOUD_SESSIONTOKEN", "")
 
     if not secret_id or not secret_key:
-        raise RuntimeError(
-            "No COS credentials. Attach an execution role to the SCF."
-        )
+        raise RuntimeError("No COS credentials. Attach an execution role to the SCF.")
 
-    # URL-encode the key for the URL, but use DECODED path for signing
     encoded_key = quote(key, safe="/")
     url = COS_ENDPOINT.format(bucket=bucket, region=region, key=encoded_key)
     host = f"{bucket}.cos.{region}.myqcloud.com"
 
-    # Headers to sign (must include host; values must match what's sent)
-    sign_headers = {
-        "host": host,
-        "content-type": "text/csv",
-    }
+    sign_headers = {"host": host}
+    if body is not None:
+        sign_headers["content-type"] = "text/csv"
     if token:
         sign_headers["x-cos-security-token"] = token
 
-    # Sign the request (path is the decoded form per COS docs)
-    auth = _cos_sign(secret_id, secret_key, "PUT", f"/{key}", sign_headers)
+    auth = _cos_sign(secret_id, secret_key, method, f"/{key}", sign_headers)
 
-    logger.info("Uploading %d bytes to cos://%s/%s", len(body), bucket, key)
-
-    req = Request(url, data=body, method="PUT")
+    req = Request(url, data=body, method=method)
     req.add_header("Host", host)
-    req.add_header("Content-Type", "text/csv")
-    req.add_header("Content-Length", str(len(body)))
+    if body is not None:
+        req.add_header("Content-Type", "text/csv")
+        req.add_header("Content-Length", str(len(body)))
     if token:
         req.add_header("x-cos-security-token", token)
     req.add_header("Authorization", auth)
 
     try:
         with urlopen(req, timeout=120) as resp:
-            if resp.status not in (200, 204):
-                body_text = resp.read().decode("utf-8", errors="replace")
-                raise RuntimeError(
-                    f"COS PUT failed: HTTP {resp.status} — {body_text[:1000]}"
-                )
+            return resp.read()
     except HTTPError as e:
-        # Capture the COS error response body for debugging
         error_body = ""
         try:
             error_body = e.read().decode("utf-8", errors="replace")
         except Exception:
             pass
         raise RuntimeError(
-            f"COS upload failed for {key}: HTTP {e.code} {e.reason} "
+            f"COS {method} failed for {key}: HTTP {e.code} {e.reason} "
             f"— Response: {error_body[:1000]}"
         )
     except URLError as e:
-        raise RuntimeError(f"COS upload failed for {key}: {e}")
+        raise RuntimeError(f"COS {method} failed for {key}: {e}")
+
+
+def upload_to_cos(bucket: str, region: str, key: str, body: bytes):
+    """Upload bytes to COS via a signed PUT."""
+    logger.info("Uploading %d bytes to cos://%s/%s", len(body), bucket, key)
+    _cos_request("PUT", bucket, region, key, body=body)
     logger.info("COS upload complete")
+
+
+def download_from_cos(bucket: str, region: str, key: str) -> bytes:
+    """Download bytes from COS via a signed GET."""
+    logger.info("Downloading cos://%s/%s", bucket, key)
+    data = _cos_request("GET", bucket, region, key)
+    logger.info("COS download complete (%d bytes)", len(data))
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +631,7 @@ def main_handler(event, context):
     Trigger: Timer (monthly cron) or manual / API Gateway invocation.
 
     Reads MONTH from env var, fetches all bill details from the billing API,
+    resolves the active column set (catalog defaults + config overrides),
     flattens components, aggregates by group, writes CSV to COS.
     """
     logger.info("Event: %s", json.dumps(event, default=str))
@@ -572,20 +667,29 @@ def main_handler(event, context):
         logger.warning("No bill details returned for month %s", month)
         return {"status": "empty", "month": month, "detail_records": 0}
 
+    # --- Resolve active columns ---
+    overrides = load_column_overrides()
+    group_cols, sum_cols, pass_cols = resolve_fixed_columns(overrides)
+    tag_cols = resolve_tag_columns(overrides, discover_tag_keys(raw_details))
+    full_pass_cols = pass_cols + tag_cols
+    output_cols = group_cols + full_pass_cols + sum_cols
+    logger.info("Columns: %d group, %d pass-through (incl. %d tags), %d sum",
+                len(group_cols), len(full_pass_cols), len(tag_cols), len(sum_cols))
+
     # --- Flatten ComponentSet ---
-    flat_rows = flatten_details(raw_details)
+    flat_rows = flatten_details(raw_details, tag_cols)
     logger.info("Flattened to %d component-level rows", len(flat_rows))
 
     # --- Aggregate ---
-    aggregated = aggregate(flat_rows)
+    aggregated = aggregate(flat_rows, group_cols, sum_cols, full_pass_cols)
     logger.info("Aggregated to %d rows", len(aggregated))
 
     # --- Write CSV to COS ---
-    output_csv = write_csv(aggregated)
+    output_csv = write_csv(aggregated, output_cols)
     dest_key = f"{DEST_KEY_PREFIX}{month}_aggregated.csv"
     upload_to_cos(DEST_BUCKET, DEST_REGION, dest_key, output_csv)
 
-    logger.info("Done. %d rows → cos://%s/%s", len(aggregated), DEST_BUCKET, dest_key)
+    logger.info("Done. %d rows -> cos://%s/%s", len(aggregated), DEST_BUCKET, dest_key)
 
     return {
         "status": "ok",
@@ -593,5 +697,6 @@ def main_handler(event, context):
         "detail_records": len(raw_details),
         "component_rows": len(flat_rows),
         "aggregated_rows": len(aggregated),
+        "columns": output_cols,
         "destination": f"cos://{DEST_BUCKET}/{dest_key}",
     }

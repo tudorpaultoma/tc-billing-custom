@@ -30,29 +30,28 @@ Replace `${region}`, `${appid}`, `${dest-bucket}` with your actual values.
   "statement": [
     {
       "effect": "allow",
-      "action": ["finance:DescribeBillDetail"],
+      "action": ["finance:DescribeBill*"],
       "resource": "*"
     },
     {
       "effect": "allow",
-      "action": ["cos:PutObject"],
+      "action": ["cos:PutObject", "cos:GetObject"],
       "resource": [
         "qcs::cos:ap-singapore:uid/1234567890:mycompany-reports-1234567890/*"
       ]
     },
     {
       "effect": "allow",
-      "action": [
-        "cls:CreateLogset",
-        "cls:CreateTopic",
-        "cls:PutLogs",
-        "cls:SearchLog"
-      ],
+      "action": ["cls:*"],
       "resource": "*"
     }
   ]
 }
 ```
+
+> `cos:GetObject` is only needed if you load the column config from COS. If the
+> config lives in a **different** bucket, add a `cos:GetObject` rule for that
+> bucket as well.
 
 ### How to get your APPID and bucket names
 
@@ -106,7 +105,41 @@ This creates `tc-billing-processor.zip` with `index.py` and all SDK dependencies
 | `BILLING_REGION` | No | `ap-singapore` | Billing API region (intl endpoint) |
 | `DEST_REGION` | No | `BILLING_REGION` | Region of destination COS bucket |
 | `DEST_KEY_PREFIX` | No | `aggregated-bills/` | Prefix (folder) for output files |
-| `PAGE_LIMIT` | No | `1000` | Records per API page (max allowed) |
+| `PAGE_LIMIT` | No | `300` | Records per API page (intl endpoint max) |
+| `COLUMN_CONFIG` | No | — | Inline column config text (see "Configuring columns") |
+| `CONFIG_BUCKET` | No | — | COS bucket holding a column config file |
+| `CONFIG_KEY` | No | — | COS object key (path) of the config file |
+| `CONFIG_REGION` | No | `DEST_REGION` | Region of the config bucket |
+
+---
+
+### Configuring columns
+
+The output columns are configurable via a text file (or inline env var). Each
+line selects a column:
+
+```
+ZoneName = IN          # add an opt-in column
+OriginalCost = OUT     # drop a default column
+tag_key:* = IN         # include every tag key found
+```
+
+Accepted forms: `Column = IN`, `Column,IN`, or `Column IN`. A full template
+listing every available column (with its default and kind) is in
+[`columns.example`](../columns.example).
+
+Supply it one of two ways:
+
+1. **COS file** (recommended — reconfigure without redeploying): upload the
+   config text as a COS object, then set `CONFIG_BUCKET` + `CONFIG_KEY`
+   (+ `CONFIG_REGION` if it differs from the destination). Add `cos:GetObject`
+   on the config bucket to the execution role.
+2. **Inline env var**: set `COLUMN_CONFIG` to the raw text (small overrides only;
+   SCF env vars are size-limited).
+
+Columns can only be toggled on/off — their aggregation kind (group / sum /
+pass-through) is fixed by the catalog in `index.py`, so you cannot accidentally
+sum a text field.
 
 ---
 
@@ -179,3 +212,7 @@ Same output schema as before — grouped and aggregated:
 | tag_key:Type | First value per group |
 | Product Code | First value per group |
 | Bill Month | First value per group |
+
+> Columns are configurable — see "Configuring columns" above for how to add or
+> remove them. `SP Deduction` maps to the API's `SPDeduction` and
+> `SP Deduction(Cost)` maps to `OriginalCostWithSP`.
